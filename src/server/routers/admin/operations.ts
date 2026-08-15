@@ -1,65 +1,16 @@
 import { z } from "zod";
-import { and, eq, gte, sql, lte, desc, inArray } from "drizzle-orm";
+import { and, eq, gte, inArray, lte, sql } from "drizzle-orm";
 import {
-  users,
-  memberships,
-  classes,
   bookings,
-  payments,
+  classes,
+  users,
   checkins,
+  memberships,
   membershipPlans,
 } from "@/db/schema";
-import { router, adminProcedure } from "../trpc";
+import { router, adminProcedure } from "../../trpc";
 
-export const adminRouter = router({
-  stats: adminProcedure.query(async ({ ctx }) => {
-    const today = new Date().toISOString().slice(0, 10);
-    const now = new Date().toISOString();
-
-    const [{ totalMembers }] = await ctx.db
-      .select({ totalMembers: sql<number>`count(*)` })
-      .from(users)
-      .where(eq(users.role, "member"));
-
-    const [{ activeMemberships }] = await ctx.db
-      .select({ activeMemberships: sql<number>`count(*)` })
-      .from(memberships)
-      .where(
-        and(
-          eq(memberships.status, "active"),
-          sql`${memberships.endDate} >= ${today}`,
-        ),
-      );
-
-    const [{ upcomingClasses }] = await ctx.db
-      .select({ upcomingClasses: sql<number>`count(*)` })
-      .from(classes)
-      .where(and(gte(classes.startsAt, now), eq(classes.cancelled, false)));
-
-    const [{ revenueCents }] = await ctx.db
-      .select({ revenueCents: sql<number>`coalesce(sum(amount_cents), 0)` })
-      .from(payments)
-      .where(eq(payments.status, "paid"));
-
-    const [{ totalCheckins }] = await ctx.db
-      .select({ totalCheckins: sql<number>`count(*)` })
-      .from(checkins);
-
-    const [{ pendingPayments }] = await ctx.db
-      .select({ pendingPayments: sql<number>`count(*)` })
-      .from(payments)
-      .where(eq(payments.status, "pending"));
-
-    return {
-      totalMembers: Number(totalMembers),
-      activeMemberships: Number(activeMemberships),
-      upcomingClasses: Number(upcomingClasses),
-      revenueCents: Number(revenueCents),
-      totalCheckins: Number(totalCheckins),
-      pendingPayments: Number(pendingPayments),
-    };
-  }),
-
+export const operationsRouter = router({
   classUtilisation: adminProcedure
     .input(z.object({ limit: z.number().default(10) }).default({}))
     .query(async ({ ctx, input }) => {
@@ -85,42 +36,6 @@ export const adminRouter = router({
         utilisation: r.capacity ? Number(r.booked) / r.capacity : 0,
       }));
     }),
-
-  revenueByMonth: adminProcedure.query(async ({ ctx }) => {
-    const rows = await ctx.db
-      .select({
-        month: sql<string>`strftime('%Y-%m', ${payments.createdAt})`,
-        totalCents: sql<number>`coalesce(sum(${payments.amountCents}), 0)`,
-      })
-      .from(payments)
-      .where(eq(payments.status, "paid"))
-      .groupBy(sql`strftime('%Y-%m', ${payments.createdAt})`)
-      .orderBy(sql`strftime('%Y-%m', ${payments.createdAt}) DESC`);
-
-    return rows.map((r) => ({
-      month: r.month,
-      totalCents: Number(r.totalCents),
-    }));
-  }),
-
-  revenueByMethod: adminProcedure.query(async ({ ctx }) => {
-    const rows = await ctx.db
-      .select({
-        method: payments.method,
-        totalCents: sql<number>`coalesce(sum(${payments.amountCents}), 0)`,
-        count: sql<number>`count(*)`,
-      })
-      .from(payments)
-      .where(eq(payments.status, "paid"))
-      .groupBy(payments.method)
-      .orderBy(sql`sum(${payments.amountCents}) DESC`);
-
-    return rows.map((r) => ({
-      method: r.method,
-      totalCents: Number(r.totalCents),
-      count: Number(r.count),
-    }));
-  }),
 
   expiringMemberships: adminProcedure.query(async ({ ctx }) => {
     const today = new Date().toISOString().slice(0, 10);
@@ -149,15 +64,6 @@ export const adminRouter = router({
       .orderBy(memberships.endDate);
 
     return rows;
-  }),
-
-  refundCount: adminProcedure.query(async ({ ctx }) => {
-    const [result] = await ctx.db
-      .select({ count: sql<number>`count(*)` })
-      .from(payments)
-      .where(eq(payments.status, "refunded"));
-
-    return { count: Number(result.count) };
   }),
 
   checkinsPerDay: adminProcedure.query(async ({ ctx }) => {

@@ -2,17 +2,10 @@ import { z } from "zod";
 import { TRPCError } from "@trpc/server";
 import { eq, and, gte } from "drizzle-orm";
 import { classes, users, trainerAvailability } from "@/db/schema";
-import { router, protectedProcedure } from "../trpc";
+import { router, protectedProcedure, trainerProcedure } from "../trpc";
 
 export const trainersRouter = router({
-  upcomingClasses: protectedProcedure.query(async ({ ctx }) => {
-    if (ctx.user.role !== "trainer") {
-      throw new TRPCError({
-        code: "FORBIDDEN",
-        message: "Only trainers can access this.",
-      });
-    }
-
+  upcomingClasses: trainerProcedure.query(async ({ ctx }) => {
     const now = new Date().toISOString();
 
     return ctx.db
@@ -35,14 +28,7 @@ export const trainersRouter = router({
       .orderBy(classes.startsAt);
   }),
 
-  availability: protectedProcedure.query(async ({ ctx }) => {
-    if (ctx.user.role !== "trainer") {
-      throw new TRPCError({
-        code: "FORBIDDEN",
-        message: "Only trainers can access this.",
-      });
-    }
-
+  availability: trainerProcedure.query(async ({ ctx }) => {
     const rows = await ctx.db
       .select()
       .from(trainerAvailability)
@@ -52,7 +38,7 @@ export const trainersRouter = router({
     return rows;
   }),
 
-  setAvailability: protectedProcedure
+  setAvailability: trainerProcedure
     .input(
       z.object({
         dayOfWeek: z.number().int().min(0).max(6),
@@ -61,13 +47,6 @@ export const trainersRouter = router({
       }),
     )
     .mutation(async ({ ctx, input }) => {
-      if (ctx.user.role !== "trainer") {
-        throw new TRPCError({
-          code: "FORBIDDEN",
-          message: "Only trainers can access this.",
-        });
-      }
-
       const existing = await ctx.db
         .select()
         .from(trainerAvailability)
@@ -103,16 +82,9 @@ export const trainersRouter = router({
       }
     }),
 
-  removeAvailability: protectedProcedure
+  removeAvailability: trainerProcedure
     .input(z.object({ dayOfWeek: z.number().int().min(0).max(6) }))
     .mutation(async ({ ctx, input }) => {
-      if (ctx.user.role !== "trainer") {
-        throw new TRPCError({
-          code: "FORBIDDEN",
-          message: "Only trainers can access this.",
-        });
-      }
-
       const existing = await ctx.db
         .select()
         .from(trainerAvailability)

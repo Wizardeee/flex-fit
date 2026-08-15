@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { TRPCError } from "@trpc/server";
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import {
   corporateBookings,
   classes,
@@ -8,18 +8,24 @@ import {
   companyMembers,
   checkins,
   users,
+  notifications,
 } from "@/db/schema";
 import { router, protectedProcedure, staffProcedure } from "../trpc";
+import { assertClassBookable, isFull as isClassFull, isOwnerOrStaff, isRefundable, promoteNextWaitlisted } from "@/features/bookings/booking.service";
+import { FREE_CANCELLATION_HOURS } from "@/features/bookings/constant";
+import { CORPORATE_FREE_CANCELLATION_HOURS } from "@/features/bookings/constant";
+
+
 
 /**
  * Corporate members may cancel free of charge up to this many hours before
  * the class starts. Cancelling later still frees the spot but forfeits the credit.
  */
-export const CORPORATE_FREE_CANCELLATION_HOURS = 24;
+//export const CORPORATE_FREE_CANCELLATION_HOURS = 24;
 
-function hoursUntil(iso: string, now = new Date()): number {
-  return (new Date(iso).getTime() - now.getTime()) / 36e5;
-}
+//function hoursUntil(iso: string, now = new Date()): number {
+  //return (new Date(iso).getTime() - now.getTime()) / 36e5;
+//}
 
 async function getCompanyForMember(
   db: typeof import("@/db").db,
@@ -76,22 +82,7 @@ export const corporateBookingsRouter = router({
         .from(classes)
         .where(eq(classes.id, input.classId))
         .get();
-
-      if (!cls) {
-        throw new TRPCError({ code: "NOT_FOUND", message: "Class not found." });
-      }
-      if (cls.cancelled) {
-        throw new TRPCError({
-          code: "BAD_REQUEST",
-          message: "This class has been cancelled.",
-        });
-      }
-      if (hoursUntil(cls.startsAt) <= 0) {
-        throw new TRPCError({
-          code: "BAD_REQUEST",
-          message: "This class has already started.",
-        });
-      }
+      assertClassBookable(cls);
 
       const existing = await ctx.db
         .select()
@@ -128,17 +119,12 @@ export const corporateBookingsRouter = router({
         });
       }
 
-      const [{ count }] = await ctx.db
-        .select({ count: sql<number>`count(*)` })
-        .from(corporateBookings)
-        .where(
-          and(
-            eq(corporateBookings.classId, cls.id),
-            eq(corporateBookings.status, "booked"),
-          ),
-        );
-
-      const isFull = Number(count) >= cls.capacity;
+      const isFull = await isClassFull(
+        ctx.db,
+        corporateBookings,
+        cls.id,
+        cls.capacity,
+      );
 
       const created = await ctx.db
         .insert(corporateBookings)
@@ -178,9 +164,7 @@ export const corporateBookingsRouter = router({
         throw new TRPCError({ code: "NOT_FOUND", message: "Booking not found." });
       }
 
-      const isOwner = row.booking.userId === ctx.user.id;
-      const isStaff = ctx.user.role === "admin" || ctx.user.role === "trainer";
-      if (!isOwner && !isStaff) {
+      if (!isOwnerOrStaff(ctx.user.id, ctx.user.role, row.booking.userId)) {
         throw new TRPCError({
           code: "FORBIDDEN",
           message: "You cannot cancel this booking.",
@@ -194,9 +178,11 @@ export const corporateBookingsRouter = router({
         });
       }
 
-      const refundable =
-        hoursUntil(row.cls.startsAt) >= CORPORATE_FREE_CANCELLATION_HOURS &&
-        row.booking.creditsUsed > 0;
+      const refundable = isRefundable(
+        row.cls.startsAt,
+        CORPORATE_FREE_CANCELLATION_HOURS,
+        row.booking.creditsUsed,
+      );
 
       await ctx.db
         .update(corporateBookings)
@@ -223,40 +209,40 @@ export const corporateBookingsRouter = router({
 
       // Freeing a confirmed spot promotes the member who has waited longest.
       if (row.booking.status === "booked") {
-        const next = await ctx.db
-          .select()
-          .from(corporateBookings)
-          .where(
-            and(
-              eq(corporateBookings.classId, row.cls.id),
-              eq(corporateBookings.status, "waitlisted"),
-            ),
-          )
-          .orderBy(asc(corporateBookings.bookedAt))
-          .get();
+        const next = await promoteNextWaitlisted(
+          ctx.db,
+          corporateBookings,
+          row.cls.id,
+        );
 
         if (next) {
-          await ctx.db
-            .update(corporateBookings)
-            .set({ status: "booked", creditsUsed: row.cls.creditCost })
-            .where(eq(corporateBookings.id, next.id));
+          // Notify ONLY the promoted member; users who were not promoted
+          // must not receive a notification.
+          await ctx.db.insert(notifications).values({
+            userId: next.userId,
+            type: "waitlist_promotion" as const,
+            title: "You've been promoted!",
+            message: `You have been promoted from the waitlist to a confirmed spot for ${row.cls.name}.`,
+          });
 
-          const company = await ctx.db
-            .select()
-            .from(companies)
-            .where(eq(companies.id, next.companyId))
-            .get();
+          if ("companyId" in next) {
+            const company = await ctx.db
+              .select()
+              .from(companies)
+              .where(eq(companies.id, next.companyId))
+              .get();
 
-          if (company && company.creditPoolBalance >= row.cls.creditCost) {
-            await ctx.db
-              .update(companies)
-              .set({
-                creditPoolBalance: Math.max(
-                  0,
-                  company.creditPoolBalance - row.cls.creditCost,
-                ),
-              })
-              .where(eq(companies.id, company.id));
+            if (company && company.creditPoolBalance >= row.cls.creditCost) {
+              await ctx.db
+                .update(companies)
+                .set({
+                  creditPoolBalance: Math.max(
+                    0,
+                    company.creditPoolBalance - row.cls.creditCost,
+                  ),
+                })
+                .where(eq(companies.id, company.id));
+            }
           }
         }
       }
@@ -295,7 +281,7 @@ export const corporateBookingsRouter = router({
 
       await ctx.db.insert(checkins).values({
         userId: booking.userId,
-        bookingId: null,
+        bookingId: booking.id,
       });
 
       return { ok: true };

@@ -1,7 +1,8 @@
 import { z } from "zod";
 import { TRPCError } from "@trpc/server";
-import { and, asc, eq, gte, lte, sql } from "drizzle-orm";
-import { classes, bookings, users } from "@/db/schema";
+import { and, asc, eq, gte, inArray, lte, sql } from "drizzle-orm";
+import { classes, bookings, users, memberships, notifications } from "@/db/schema";
+import { UNLIMITED_CREDITS } from "@/features/bookings/constant";
 import { router, publicProcedure, staffProcedure, adminProcedure } from "../trpc";
 
 export const classesRouter = router({
@@ -143,12 +144,67 @@ export const classesRouter = router({
         throw new TRPCError({ code: "NOT_FOUND", message: "Class not found." });
       }
 
+      const affected = await ctx.db
+        .select({
+          userId: bookings.userId,
+          membershipId: bookings.membershipId,
+          creditsUsed: bookings.creditsUsed,
+        })
+        .from(bookings)
+        .where(
+          and(
+            eq(bookings.classId, input.id),
+            inArray(bookings.status, ["booked", "waitlisted"]),
+          ),
+        );
+
       await ctx.db
         .update(bookings)
         .set({ status: "cancelled", cancelledAt: new Date().toISOString() })
         .where(
-          and(eq(bookings.classId, input.id), eq(bookings.status, "booked")),
+          and(
+            eq(bookings.classId, input.id),
+            inArray(bookings.status, ["booked", "waitlisted"]),
+          ),
         );
+
+      // Refund the exact creditsUsed to booked members (same semantics as the
+      // personal cancel flow). Waitlisted rows always have creditsUsed = 0 and
+      // are therefore never refunded.
+      for (const b of affected) {
+        if (b.creditsUsed > 0 && b.membershipId) {
+          const ms = await ctx.db
+            .select()
+            .from(memberships)
+            .where(eq(memberships.id, b.membershipId))
+            .get();
+
+          if (ms && ms.creditsRemaining < UNLIMITED_CREDITS) {
+            await ctx.db
+              .update(memberships)
+              .set({ creditsRemaining: ms.creditsRemaining + b.creditsUsed })
+              .where(eq(memberships.id, ms.id));
+          }
+        }
+      }
+
+      // Notify every affected member (booked and waitlisted) that the class
+      // was cancelled, using the exact notification schema and the
+      // class_cancelled type already used by the seed data.
+      if (affected.length > 0) {
+        const date = new Date(cls.startsAt).toLocaleDateString("en-US", {
+          month: "short",
+          day: "numeric",
+        });
+        await ctx.db.insert(notifications).values(
+          affected.map((b) => ({
+            userId: b.userId,
+            type: "class_cancelled" as const,
+            title: "Class cancelled",
+            message: `The ${cls.name} class on ${date} has been cancelled by staff.`,
+          })),
+        );
+      }
 
       return cls;
     }),
